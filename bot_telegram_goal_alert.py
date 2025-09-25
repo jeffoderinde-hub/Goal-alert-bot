@@ -1,335 +1,351 @@
-# -*- coding: utf-8 -*-
-import os, time, math, traceback, collections
-from datetime import datetime, timedelta, timezone
+# bot_telegram_goal_alert.py
+# v2.1 — window-accurate alerts + pending->success/failed edits + success ping + no getUpdates conflict
 
+import os
+import time
+import math
+import logging
+from datetime import datetime, timezone, timedelta
 import requests
 from telegram import Bot, ParseMode
-from telegram.ext import Updater, CommandHandler
 
-# ======================
-# TELEGRAM BASICS
-# ======================
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
-TELEGRAM_DM_CHAT_ID = os.getenv("TELEGRAM_DM_CHAT_ID")  # your private id
+# ---------------- Logging ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("jbot")
 
-if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN/TELEGRAM_TOKEN or TELEGRAM_GROUP_CHAT_ID/TELEGRAM_CHAT_ID")
-TELEGRAM_CHAT_ID = int(TELEGRAM_CHAT_ID)
+# ---------------- ENV ----------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+CHAT_ID        = int(os.getenv("TELEGRAM_GROUP_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID"))
+API_KEY        = os.getenv("API_FOOTBALL_KEY")
 
+# Core knobs
+POLL_SECS       = int(os.getenv("POLL_SECS", 15))
+LOOKAHEAD_MIN   = int(os.getenv("LOOKAHEAD_MIN", 12))
+GOAL_THRESHOLD  = float(os.getenv("GOAL_THRESHOLD", 0.60))
+ROLLING_SECONDS = int(os.getenv("ROLLING_SECONDS", 900))   # last ~15m for events
+COOLDOWN_SECS   = int(os.getenv("COOLDOWN_SECS", 240))     # per-fixture cool-down
+
+# Windows (inclusive)
+W1_START = int(os.getenv("GOAL_WINDOW_1H_START", 18))
+W1_END   = int(os.getenv("GOAL_WINDOW_1H_END", 25))
+W2_START = int(os.getenv("GOAL_WINDOW_2H_START", 65))
+W2_END   = int(os.getenv("GOAL_WINDOW_2H_END", 72))
+
+GRACE_SECS = int(os.getenv("GOAL_CHECK_GRACE_SECS", 30))
+
+STARTUP_MSG  = os.getenv("STARTUP_MESSAGE_ENABLED", "0") == "1"
+HEARTBEAT    = os.getenv("HEARTBEAT_ENABLED", "0") == "1"
+SUCCESS_PING = os.getenv("SUCCESS_PING_ENABLED", "1") == "1"  # <— extra ping on success
+
+if not TELEGRAM_TOKEN or not CHAT_ID or not API_KEY:
+    raise SystemExit("Missing envs: TELEGRAM_BOT_TOKEN, TELEGRAM_GROUP_CHAT_ID, API_FOOTBALL_KEY")
+
+# ---------------- Telegram (no getUpdates) ----------------
 bot = Bot(token=TELEGRAM_TOKEN)
 
-def send(text, parse_mode="HTML"):
-    try:
-        bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=text,
-            parse_mode=parse_mode,
-            disable_web_page_preview=True
-        )
-    except Exception as e:
-        print("Telegram send error:", e)
+def send_text(chat_id, text):
+    return bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
 
-def edit_message(msg_id, new_text, parse_mode="HTML"):
-    try:
-        bot.edit_message_text(
-            chat_id=TELEGRAM_CHAT_ID,
-            message_id=msg_id,
-            text=new_text,
-            parse_mode=parse_mode,
-            disable_web_page_preview=True
-        )
-    except Exception as e:
-        print("Telegram edit error:", e)
+def edit_text(chat_id, message_id, old_text, new_text):
+    if (old_text or "").strip() != (new_text or "").strip():
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=new_text, parse_mode=ParseMode.MARKDOWN)
+        return new_text
+    return old_text
 
-# ======================
-# API-FOOTBALL CLIENT
-# ======================
-API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
-if not API_FOOTBALL_KEY:
-    raise RuntimeError("Missing API_FOOTBALL_KEY")
+# ---------------- Helpers ----------------
+def now_utc(): return datetime.now(timezone.utc)
 
-AF_BASE = "https://v3.football.api-sports.io"
-AF_HEADERS = {"x-apisports-key": API_FOOTBALL_KEY}
-SEASON = os.getenv("SEASON", str(datetime.utcnow().year))
+def minutes_and_half(elapsed_total: int):
+    if elapsed_total is None:
+        return None, None
+    if elapsed_total <= 45:
+        return 1, elapsed_total
+    return 2, elapsed_total
 
-session = requests.Session()
-session.headers.update(AF_HEADERS)
+def in_window(half, half_min):
+    if half == 1:
+        return W1_START <= half_min <= W1_END
+    if half == 2:
+        return W2_START <= half_min <= W2_END
+    return False
 
-def af_get(path, params=None, timeout=20):
-    r = session.get(f"{AF_BASE}{path}", params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+def suggest_market(half, home, away):
+    if half == 1:
+        return "Over 0.5 First-Half Goals" if (home + away == 0) else "Over 1.5 Match Goals"
+    # second half
+    if home + away <= 1:   return "Over 1.5 Match Goals"
+    if home + away == 2:   return "Over 2.5 Match Goals"
+    return "Over 3.5 Match Goals"
 
-# ======================
-# NEXT GOAL ENGINE
-# ======================
-POLL_SECS       = int(os.getenv("POLL_SECS", "15"))
-GOAL_THRESHOLD  = float(os.getenv("GOAL_THRESHOLD", "0.60"))
-COOLDOWN_SECS   = int(os.getenv("COOLDOWN_SECS", "240"))
-ROLLING_SECONDS = int(os.getenv("ROLLING_SECONDS", "900"))
-LOOKAHEAD_MIN   = int(os.getenv("LOOKAHEAD_MIN", "12"))
+def pressure_index(shots, sot, corners):
+    return round(shots*1.0 + sot*2.0 + corners*1.5, 1)
 
-class NGState:
-    def __init__(self):
-        self.last_totals = None
-        self.roll = collections.deque()
-        self.last_prob = 0.0
-        self.active_msg_id = None
-        self.alert_window_end_min = None
-        self.alert_start_min = None
-        self.alert_score = None
-        self.alert_status = None
-        self.last_score_seen = None
+def prob_from_counts(shots, sot, corners):
+    x = 0.18*shots + 0.42*sot + 0.25*corners
+    p = 1.0/(1.0 + math.exp(-x + 3.0))  # smoothed logistic
+    return round(p, 2)
 
-    def add_delta(self, ts, ds, dsot, dcor, dred):
-        self.roll.append((ts, ds, dsot, dcor, dred))
-        cutoff = ts - ROLLING_SECONDS
-        while self.roll and self.roll[0][0] < cutoff:
-            self.roll.popleft()
-
-    def sums(self):
-        s = sot = c = r = 0
-        for _, a, b, d, e in self.roll:
-            s += a; sot += b; c += d; r += e
-        return s, sot, c, r
-
-def get_live_fixtures():
-    js = af_get("/fixtures", {"live": "all"})
-    return js.get("response", [])
-
-def get_fixture_stats(fid):
-    js = af_get("/fixtures/statistics", {"fixture": fid})
-    return js.get("response", [])
-
-def extract_totals(stats_json):
-    out = {"shots":0, "sot":0, "corners":0, "reds":0}
-    for side in stats_json:
-        for it in side.get("statistics", []):
-            name = (it.get("type") or "").lower()
-            val  = it.get("value")
-            v = val if isinstance(val, (int, float)) else 0
-            if name in ("total shots", "shots total"): out["shots"] += v
-            elif name in ("shots on target", "shots on goal"): out["sot"] += v
-            elif name in ("corner kicks", "corners"): out["corners"] += v
-            elif name == "red cards": out["reds"] += v
-    return out
-
-def pressure_index(s, sot, cor, reds):
-    pi = 1.0*s + 2.2*sot + 1.2*cor
-    if reds > 0: pi += 10.0
-    return max(0.0, min(25.0, pi))
-
-def goal_probability(pi, minute):
-    base = 1 - math.exp(-0.11 * pi)
-    window_boost = 0.10 if (20 <= minute <= 25 or 65 <= minute <= 70) else 0.0
-    horizon_boost = max(0, min(0.10, (LOOKAHEAD_MIN - 10) * 0.01))
-    return max(0.0, min(0.98, base + window_boost + horizon_boost))
-
-def pick_over_line(score, minute):
-    h, a = [int(x) for x in score.split("-")]
-    total = h + a
-    if minute < 45:
-        return "Over 0.5 goals (First Half)" if total == 0 else "Over 1.5 goals"
-    return "Over 1.5 goals" if total <= 1 else "Over 2.5 goals"
-
-def format_goal_card(match, minute, score, prob, pi, shots10, sot10, cor10, status):
-    half = "First Half" if minute < 45 else "Second Half"
-    status_emoji = "⏳" if status == "Pending" else ("✅" if status == "Success" else "❌")
-    return (
-        "🎟️ <b>JBOT GOAL ALERT</b>\n\n"
-        f"<b>Match:</b> {match}\n"
-        f"⏱️ <b>Time:</b> {half} ({minute}′)\n"
-        f"🔢 <b>Score:</b> {score}\n\n"
-        f"<b>Probability:</b> {int(prob*100)}% (next ~{LOOKAHEAD_MIN} minutes)\n"
-        f"<b>Pressure Index:</b> {pi:.1f}\n\n"
-        "<b>Form (Last 10 Minutes):</b>\n"
-        f"• Shots: {shots10}\n"
-        f"• Shots on Target: {sot10}\n"
-        f"• Corners: {cor10}\n\n"
-        f"✅ <b>Recommended Bet:</b> {pick_over_line(score, minute)}\n\n"
-        f"📌 <b>Status:</b> {status} {status_emoji}"
-    )
-
-ng_states = {}
-
-def next_goal_loop_cycle():
-    now_ts = datetime.now(timezone.utc).timestamp()
-    fixtures = get_live_fixtures()
-
-    for f in fixtures:
-        fid = f["fixture"]["id"]
-        st  = ng_states.get(fid) or NGState(); ng_states[fid] = st
-
-        minute = int(f["fixture"]["status"].get("elapsed") or 0)
-        status_short = f["fixture"]["status"].get("short", "")
-        home = f["teams"]["home"]["name"]; away = f["teams"]["away"]["name"]
-        hg = f["goals"]["home"] or 0; ag = f["goals"]["away"] or 0
-        score = f"{hg}-{ag}"
-        st.last_score_seen = score
-
-        if status_short in ("1H","2H","ET","LIVE","INP") or minute > 0:
-            totals = extract_totals(get_fixture_stats(fid))
-            if st.last_totals is None:
-                st.last_totals = totals
-                continue
-            ds   = max(0, totals["shots"]   - st.last_totals["shots"])
-            dsot = max(0, totals["sot"]     - st.last_totals["sot"])
-            dcor = max(0, totals["corners"] - st.last_totals["corners"])
-            dred = max(0, totals["reds"]    - st.last_totals["reds"])
-            st.last_totals = totals
-            st.add_delta(now_ts, ds, dsot, dcor, dred)
-            rs, rsot, rcor, rred = st.sums()
-            pi = pressure_index(rs, rsot, rcor, rred)
-            p  = goal_probability(pi, minute)
-
-            if (st.active_msg_id is None) and (p >= GOAL_THRESHOLD):
-                st.alert_start_min = minute
-                st.alert_window_end_min = min(90, minute + LOOKAHEAD_MIN)
-                st.alert_score = score
-                st.alert_status = "Pending"
-                text = format_goal_card(
-                    f"{home} vs {away}", minute, score, p, pi, int(rs), int(rsot), int(rcor), st.alert_status
-                )
-                msg = bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-                st.active_msg_id = msg.message_id
-
-            if st.active_msg_id is not None:
-                if st.alert_status == "Pending" and score != st.alert_score:
-                    st.alert_status = "Success"
-                if st.alert_status == "Pending" and minute >= (st.alert_window_end_min or minute):
-                    st.alert_status = "Failed"
-                text = format_goal_card(
-                    f"{home} vs {away}", minute, score, p, pi, int(rs), int(rsot), int(rcor), st.alert_status
-                )
-                edit_message(st.active_msg_id, text)
-                if st.alert_status in ("Success","Failed"):
-                    if (now_ts - st.roll[-1][0]) >= COOLDOWN_SECS:
-                        st.active_msg_id = None
-                        st.alert_window_end_min = None
-                        st.alert_start_min = None
-                        st.alert_score = None
-                        st.alert_status = None
-                        st.last_prob = 0.0
-            st.last_prob = p
-
-# ======================
-# DAILY ACCAS
-# ======================
-ACCA_ENABLED      = os.getenv("ACCA_ENABLED","1") == "1"
-ACCA_TIME_HHMM    = os.getenv("ACCA_TIME_HHMM","10:00")
-ACCA_STAKE        = float(os.getenv("ACCA_STAKE","1"))
-ACCA_BOOKMAKER    = os.getenv("ACCA_BOOKMAKER","Bet365")
-ACCA_STYLE        = os.getenv("ACCA_STYLE","D")
-ACCA_MIN_FIXTURES = int(os.getenv("ACCA_MIN_FIXTURES","18"))
-ACCA_MARKETS = [m.strip() for m in os.getenv(
-    "ACCA_MARKETS","1X2,OVER_1_5,DOUBLE_CHANCE,BTTS_YES"
-).split(",") if m.strip()]
-
-ACCA_MAJOR_LEAGUES   = [int(x) for x in os.getenv(
-    "ACCA_MAJOR_LEAGUES","39,140,135,78,61,2,3,128,71"
-).split(",") if x.strip()]
-ACCA_FALLBACK_LEAGUES = [int(x) for x in os.getenv(
-    "ACCA_FALLBACK_LEAGUES","94,95,88,144,99,180,203,233"
-).split(",") if x.strip()]
-
-T4_MIN, T4_MAX  = 2.6, 3.8
-T7_MIN, T7_MAX  = 5.0, 7.5
-T10_MIN, T10_MAX= 25.0, 40.0
-
-def acca_collect_fixtures():
-    fx = []
-    for lid in ACCA_MAJOR_LEAGUES:
-        fx += af_get("/fixtures", {"league": lid, "season": SEASON, "from": str(datetime.utcnow().date()), "to": str((datetime.utcnow()+timedelta(days=2)).date())}).get("response", [])
-    if len(fx) < ACCA_MIN_FIXTURES:
-        for lid in ACCA_FALLBACK_LEAGUES:
-            fx += af_get("/fixtures", {"league": lid, "season": SEASON, "from": str(datetime.utcnow().date()), "to": str((datetime.utcnow()+timedelta(days=2)).date())}).get("response", [])
-    return [f for f in fx if f["fixture"]["status"]["short"] in ("NS","TBD","PST")]
-
-def leg_label(mkt, sel, teams):
-    if mkt == "1X2":
-        if sel == "Home": return f'{teams["home"]["name"]} to Win'
-        if sel == "Away": return f'{teams["away"]["name"]} to Win'
-        return "Draw"
-    if mkt == "OVER_1_5":     return "Over 1.5 Goals"
-    if mkt == "DOUBLE_CHANCE": return f"Double Chance {sel}"
-    if mkt == "BTTS_YES":     return "BTTS: Yes"
-    return None
-
-# Dummy odds fetch (replace with real /odds in production)
-def choose_leg(f):
-    return {
-        "fixture": f["fixture"]["id"],
-        "label": "Over 1.5 Goals",
-        "odds": 1.30,
-        "match": f'{f["teams"]["home"]["name"]} vs {f["teams"]["away"]["name"]}',
-        "kick": f["fixture"]["date"],
-        "bookmaker": ACCA_BOOKMAKER
-    }
-
-def build_acca(pool, legs, tmin, tmax):
-    picks = pool[:legs]
-    prod = 1.0
-    for p in picks: prod *= p["odds"]
-    return picks, prod
-
-def format_acca_block(title, picks, prod, stake, bookmaker, style="D", colour=None):
-    est = stake * prod
-    badge = {"blue":"🔵","yellow":"🟡","red":"🔴"}.get(colour,"🏷")
-    head = f"{badge} <b>{title}</b>\nStake £{stake:.2f} | Odds {prod:.2f} | Return £{est:.2f} | {bookmaker}*"
-    lines = [head,"─────────────────────────────"]
-    for i,p in enumerate(picks,1):
-        when = datetime.fromisoformat(p["kick"].replace("Z","+00:00")).strftime("%a %H:%M")
-        lines.append(f"{i}. {p['match']} — <i>{p['label']}</i> (@{p['odds']:.2f}) • {when} UTC")
-    lines.append("\n<i>* Uses Bet365 when available; else best available bookmaker.</i>")
+def option_d_text(home, away, minute_str, score_str, prob, pi, shots10, sot10, corners10, market, status_icon="⏳", status_word="Pending"):
+    lines = [
+        "🧠 *JBOT GOAL ALERT*",
+        "",
+        f"*Match:* {home} vs {away}",
+        f"🕒 *Time:* {minute_str}",
+        f"🔢 *Score:* {score_str}",
+        "",
+        f"*Probability:* {int(prob*100)}% (next ~{LOOKAHEAD_MIN} minutes)",
+        f"*Pressure Index:* {pi}",
+        "",
+        "*Form (Last 10 Minutes):*",
+        f"• Shots: {shots10}",
+        f"• Shots on Target: {sot10}",
+        f"• Corners: {corners10}",
+        "",
+        f"✅ *Recommended Bet:* {market}",
+        "",
+        f"{status_icon} *Status:* {status_word}",
+    ]
     return "\n".join(lines)
 
-def format_acca_message(a4,o4,a7,o7,a10,o10):
-    top = "🧠 <b>JBOT • Daily ACCAs</b>"
-    b4  = format_acca_block("4-Fold (safer)",a4,o4,ACCA_STAKE,ACCA_BOOKMAKER,colour="blue")
-    b7  = format_acca_block("7-Fold (balanced)",a7,o7,ACCA_STAKE,ACCA_BOOKMAKER,colour="yellow")
-    b10 = format_acca_block("10-Fold (longshot)",a10,o10,ACCA_STAKE,ACCA_BOOKMAKER,colour="red")
-    return "\n\n".join([top,b4,"",b7,"",b10])
+# ---------------- API-FOOTBALL ----------------
+BASE = "https://v3.football.api-sports.io"
+HEADERS = { "x-apisports-key": API_KEY }
 
-def send_daily_accas():
-    fixtures = acca_collect_fixtures()
-    legs = [choose_leg(f) for f in fixtures if choose_leg(f)]
-    if len(legs) < 8:
-        send("⚠️ Not enough priced fixtures for ACCAs today.")
+def api_get(path, params=None):
+    r = requests.get(BASE + path, headers=HEADERS, params=params or {}, timeout=20)
+    r.raise_for_status()
+    return r.json().get("response", [])
+
+def get_live_fixtures():
+    return api_get("/fixtures", {"live":"all"})
+
+def get_fixture_events(fixture_id):
+    return api_get("/fixtures/events", {"fixture": fixture_id})
+
+# ---------------- State ----------------
+last_sent_at   = {}   # fixture_id -> datetime (cooldown)
+pending_alerts = {}   # fixture_id -> dict (see below)
+last_heartbeat_minute = None
+
+# ---------------- Startup / Heartbeat ----------------
+def maybe_startup():
+    if STARTUP_MSG:
+        try:
+            send_text(CHAT_ID, "🚀 THE BOT IS UP AND RUNNING! YOU READY? 🔥")
+        except Exception as e:
+            log.warning("Startup message failed: %s", e)
+
+def maybe_heartbeat():
+    global last_heartbeat_minute
+    if not HEARTBEAT: return
+    m = now_utc().minute
+    if m == last_heartbeat_minute:  # already this minute
         return
-    a4,o4   = build_acca(legs,4,T4_MIN,T4_MAX)
-    a7,o7   = build_acca(legs,7,T7_MIN,T7_MAX)
-    a10,o10 = build_acca(legs,10,T10_MIN,T10_MAX)
-    msg = format_acca_message(a4,o4,a7,o7,a10,o10)
-    send(msg,parse_mode="HTML")
-    if TELEGRAM_DM_CHAT_ID:
-        bot.send_message(chat_id=int(TELEGRAM_DM_CHAT_ID),text=msg,parse_mode=ParseMode.HTML,disable_web_page_preview=True)
+    if m == 0:
+        last_heartbeat_minute = m
+        try:
+            send_text(CHAT_ID, "👀 Monitoring pressure spikes. Vibes check, squad?")
+        except Exception as e:
+            log.warning("Heartbeat failed: %s", e)
 
-def acca_command(update, context):
-    send_daily_accas()
+# ---------------- Reconcile Pending ----------------
+def format_status_line(s):
+    return {"Pending":"⏳ *Status:* Pending", "Success":"✅ *Status:* Success", "Failed":"❌ *Status:* Failed"}[s]
 
-# ======================
-# MAIN LOOP
-# ======================
+def reconcile_alerts(live_by_id):
+    to_remove = []
+
+    for fx_id, rec in list(pending_alerts.items()):
+        chat_id    = rec["chat_id"]
+        msg_id     = rec["msg_id"]
+        old_text   = rec["text_last"]
+        status     = rec["status"]
+        window_end = rec["window_end"]
+        score0     = rec["score_at_send"]
+        home       = rec.get("home")
+        away       = rec.get("away")
+        league     = rec.get("league")
+        half       = rec.get("half")
+        now        = now_utc()
+
+        data = live_by_id.get(fx_id)
+
+        # Fixture ended/vanished -> fail
+        if data is None:
+            if status == "Pending":
+                new_text = old_text.replace(format_status_line("Pending"), format_status_line("Failed"))
+                rec["text_last"] = edit_text(chat_id, msg_id, old_text, new_text)
+                rec["status"] = "Failed"
+            to_remove.append(fx_id)
+            continue
+
+        # Current score
+        h = int(data["goals"]["home"] or 0)
+        a = int(data["goals"]["away"] or 0)
+        current = f"{h}-{a}"
+
+        # Success: score changed within window
+        if current != score0 and now <= window_end and status == "Pending":
+            new_text = old_text.replace(format_status_line("Pending"), format_status_line("Success"))
+            rec["text_last"] = edit_text(chat_id, msg_id, old_text, new_text)
+            rec["status"] = "Success"
+
+            if SUCCESS_PING:
+                minute_note = "1H window" if half == 1 else "2H window"
+                try:
+                    bot.send_message(
+                        chat_id=chat_id,
+                        parse_mode=ParseMode.MARKDOWN,
+                        text=(
+                            "✅ *GOAL LANDED*\n"
+                            f"*Match:* {home} vs {away}\n"
+                            f"*League:* {league}\n"
+                            f"*Window:* {minute_note}\n"
+                            f"*New Score:* {current}"
+                        )
+                    )
+                except Exception as e:
+                    log.warning("success ping failed: %s", e)
+
+            to_remove.append(fx_id)
+            continue
+
+        # Failed: window expired without goal
+        if now > window_end and status == "Pending":
+            new_text = old_text.replace(format_status_line("Pending"), format_status_line("Failed"))
+            rec["text_last"] = edit_text(chat_id, msg_id, old_text, new_text)
+            rec["status"] = "Failed"
+            to_remove.append(fx_id)
+
+    for fx_id in to_remove:
+        pending_alerts.pop(fx_id, None)
+
+# ---------------- Main scan ----------------
+def process_live():
+    fixtures = get_live_fixtures()
+    live_by_id = {}
+
+    # Build lookup for reconcile step
+    for fx in fixtures:
+        fid = fx["fixture"]["id"]
+        live_by_id[fid] = {
+            "goals": fx.get("goals", {}),
+            "fixture": fx.get("fixture", {}),
+            "teams": fx.get("teams", {}),
+            "league": fx.get("league", {}),
+            "status": fx.get("fixture", {}).get("status", {}),
+        }
+
+    # Update outstanding alerts first
+    reconcile_alerts(live_by_id)
+
+    # Evaluate NEW alerts
+    for fx in fixtures:
+        fixture = fx["fixture"]
+        fid = fixture["id"]
+        status = fixture["status"] or {}
+        elapsed = status.get("elapsed")
+
+        # cooldown per fixture
+        if fid in last_sent_at and (now_utc() - last_sent_at[fid]).total_seconds() < COOLDOWN_SECS:
+            continue
+
+        half, half_min = minutes_and_half(elapsed)
+        if not half or not half_min or not in_window(half, half_min):
+            continue
+
+        # Pull events for candidate
+        try:
+            events = get_fixture_events(fid)
+        except Exception as e:
+            log.warning("events fetch failed for %s: %s", fid, e)
+            continue
+
+        # Count last-~ROLLING_SECONDS (use elapsed minutes)
+        now_min = elapsed or 0
+        shots10 = sot10 = corners10 = 0
+        for ev in events:
+            t = ev.get("time", {})
+            m = t.get("elapsed")
+            if m is None: 
+                continue
+            if (now_min - m) <= (ROLLING_SECONDS // 60):
+                etype  = (ev.get("type") or "").lower()
+                detail = (ev.get("detail") or "").lower()
+                if etype == "shot":
+                    shots10 += 1
+                    if "target" in detail:
+                        sot10 += 1
+                if etype == "corner":
+                    corners10 += 1
+
+        prob = prob_from_counts(shots10, sot10, corners10)
+        if prob < GOAL_THRESHOLD:
+            continue
+
+        # Build message
+        home_name = fx["teams"]["home"]["name"]
+        away_name = fx["teams"]["away"]["name"]
+        h = int(fx["goals"]["home"] or 0)
+        a = int(fx["goals"]["away"] or 0)
+        score_str  = f"{h}-{a}"
+        minute_str = f"{'First' if half==1 else 'Second'} Half ({half_min}′)"
+        pi = pressure_index(shots10, sot10, corners10)
+        market = suggest_market(half, h, a)
+
+        text = option_d_text(
+            home=home_name, away=away_name,
+            minute_str=minute_str,
+            score_str=score_str,
+            prob=prob, pi=pi,
+            shots10=shots10, sot10=sot10, corners10=corners10,
+            market=market,
+            status_icon="⏳", status_word="Pending"
+        )
+
+        try:
+            msg = send_text(CHAT_ID, text)
+        except Exception as e:
+            log.warning("send failed for %s: %s", fid, e)
+            continue
+
+        window_end_dt = now_utc() + timedelta(minutes=LOOKAHEAD_MIN) + timedelta(seconds=GRACE_SECS)
+        pending_alerts[fid] = {
+            "msg_id": msg.message_id,
+            "chat_id": CHAT_ID,
+            "sent_at": now_utc(),
+            "window_end": window_end_dt,
+            "score_at_send": score_str,
+            "text_last": text,
+            "status": "Pending",
+            # store extra for success ping
+            "home": home_name,
+            "away": away_name,
+            "league": fx["league"]["name"],
+            "half": half,
+        }
+        last_sent_at[fid] = now_utc()
+        log.info("Alert sent for fixture %s", fid)
+
+# ---------------- Runner ----------------
 def main():
-    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("acca", acca_command))
-    updater.start_polling()
+    if STARTUP_MSG:
+        try: send_text(CHAT_ID, "🚀 THE BOT IS UP AND RUNNING! YOU READY? 🔥")
+        except Exception as e: log.warning("Startup message failed: %s", e)
 
-    last_acca_date = None
     while True:
         try:
-            now = datetime.now()
-            if ACCA_ENABLED:
-                hhmm = now.strftime("%H:%M")
-                if hhmm == ACCA_TIME_HHMM and last_acca_date != now.date():
-                    last_acca_date = now.date()
-                    send_daily_accas()
-            next_goal_loop_cycle()
+            if HEARTBEAT:
+                m = now_utc().minute
+                global last_heartbeat_minute
+                if last_heartbeat_minute != m and m == 0:
+                    last_heartbeat_minute = m
+                    try: send_text(CHAT_ID, "👀 Monitoring pressure spikes. Vibes check, squad?")
+                    except Exception as e: log.warning("Heartbeat failed: %s", e)
+
+            process_live()
         except Exception as e:
-            print("Loop error:", e)
-            traceback.print_exc()
+            log.exception("loop error: %s", e)
         time.sleep(POLL_SECS)
 
 if __name__ == "__main__":
