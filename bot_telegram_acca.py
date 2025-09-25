@@ -1,174 +1,170 @@
-# bot_telegram_acca.py
-# Daily ACCA generator for JBOT (4-fold / 7-fold / 10-fold)
-# Posts every morning at ACCA_TIME_HHMM and responds to /acca
-
 import os
 import time
-import math
 import random
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
+from typing import List, Dict
+
 import requests
 from telegram import Bot, ParseMode
-from telegram.ext import Updater, CommandHandler
 
-# ---------------- Logging ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("acca")
+# ---------------------------
+# Config from environment
+# ---------------------------
+TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()        # group to post ACCAs
+API_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
+SEASON  = os.getenv("SEASON", "2024")
+ACCA_TIME_HHMM = os.getenv("ACCA_ALERT_TIME", "10:00")     # e.g. "10:00" (UTC/server time)
+SEND_ON_START = os.getenv("ACCA_SEND_ON_START", "false").lower() == "true"
 
-# ---------------- ENV ----------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GROUP_CHAT_ID  = int(os.getenv("TELEGRAM_GROUP_CHAT_ID"))
-DM_CHAT_ID     = int(os.getenv("TELEGRAM_DM_CHAT_ID", "0"))
-API_KEY        = os.getenv("API_FOOTBALL_KEY")
+# Optional preferences (safe defaults)
+TARGET_RETURNS_4  = float(os.getenv("TARGET_RETURNS_4", 3))    # ~£3 return
+TARGET_RETURNS_7  = float(os.getenv("TARGET_RETURNS_7", 5))    # ~£5 return
+TARGET_RETURNS_10 = float(os.getenv("TARGET_RETURNS_10", 30))  # ~£30 return
+STAKE_PER_ACCA    = float(os.getenv("ACCA_STAKE", 1))          # £1 per slip
 
-ACCA_ENABLED   = os.getenv("ACCA_ENABLED", "1") == "1"
-ACCA_TIME      = os.getenv("ACCA_TIME_HHMM", "10:00")
-ACCA_STAKE     = float(os.getenv("ACCA_STAKE", "1"))
-ACCA_BOOKMAKER = os.getenv("ACCA_BOOKMAKER", "Bet365")
-ACCA_STYLE     = os.getenv("ACCA_STYLE", "D")
+# If you want to constrain leagues, comma separated e.g. "39,140,78"
+LEAGUE_IDS = [x.strip() for x in os.getenv("ACCA_LEAGUE_IDS", "").split(",") if x.strip()]
 
-# Major + fallback leagues
-MAJOR = [int(x) for x in os.getenv("ACCA_MAJOR_LEAGUES","39,140,135,78,61,2,3,128,71").split(",")]
-FALLBACK = [int(x) for x in os.getenv("ACCA_FALLBACK_LEAGUES","94,95,88,144,99,180,203,233").split(",")]
+# ---------------------------
+# Logging
+# ---------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("acca-bot")
 
-# Odds ranges
-T4_MIN, T4_MAX   = float(os.getenv("ACCA_TARGET_4_MIN","2.6")), float(os.getenv("ACCA_TARGET_4_MAX","3.8"))
-T7_MIN, T7_MAX   = float(os.getenv("ACCA_TARGET_7_MIN","5.0")), float(os.getenv("ACCA_TARGET_7_MAX","7.5"))
-T10_MIN, T10_MAX = float(os.getenv("ACCA_TARGET_10_MIN","25.0")), float(os.getenv("ACCA_TARGET_10_MAX","40.0"))
+if not TOKEN or not CHAT_ID or not API_KEY:
+    raise SystemExit("Missing required env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, API_FOOTBALL_KEY")
 
-SEASON = os.getenv("SEASON","2025")
+bot = Bot(TOKEN)
 
-if not TELEGRAM_TOKEN or not GROUP_CHAT_ID or not API_KEY:
-    raise SystemExit("Missing envs: TELEGRAM_BOT_TOKEN, TELEGRAM_GROUP_CHAT_ID, API_FOOTBALL_KEY")
+# ---------------------------
+# Very light odds stub
+# (You can replace this with your real odds feed.)
+# ---------------------------
+def fetch_candidates_for_today() -> List[Dict]:
+    """
+    Returns a list of candidate selections with naive 'odds' & market.
+    In production, replace with real odds (Bet365 feed/API) and real filters.
+    """
+    # Demo list across markets we support (1X2 + BTTS + Over)
+    sample = [
+        {"league":"Premier League","match":"Arsenal vs Brentford","market":"1X2","pick":"Arsenal","odds":1.45},
+        {"league":"La Liga","match":"Barcelona vs Osasuna","market":"Over 2.5","pick":"Over 2.5","odds":1.72},
+        {"league":"Serie A","match":"Inter vs Udinese","market":"BTTS","pick":"Yes","odds":1.90},
+        {"league":"Bundesliga","match":"Leverkusen vs Mainz","market":"1X2","pick":"Leverkusen","odds":1.33},
+        {"league":"Ligue 1","match":"PSG vs Reims","market":"Over 2.5","pick":"Over 2.5","odds":1.55},
+        {"league":"Eredivisie","match":"PSV vs Heracles","market":"BTTS","pick":"Yes","odds":1.85},
+        {"league":"Championship","match":"Leeds vs Preston","market":"1X2","pick":"Leeds","odds":1.70},
+        {"league":"Portugal","match":"Benfica vs Rio Ave","market":"Over 2.5","pick":"Over 2.5","odds":1.62},
+        {"league":"Belgium","match":"Genk vs Eupen","market":"1X2","pick":"Genk","odds":1.50},
+        {"league":"Turkey","match":"Galatasaray vs Rizespor","market":"BTTS","pick":"No","odds":1.75},
+        {"league":"Scotland","match":"Celtic vs St. Mirren","market":"Over 2.5","pick":"Over 2.5","odds":1.57},
+        {"league":"MLS","match":"LAFC vs Austin","market":"BTTS","pick":"Yes","odds":1.80},
+        {"league":"Brazil A","match":"Flamengo vs Goias","market":"1X2","pick":"Flamengo","odds":1.52},
+        {"league":"Brazil B","match":"Avai vs Mirassol","market":"Over 2.5","pick":"Over 2.5","odds":1.95},
+        {"league":"Argentina","match":"River vs Sarmiento","market":"1X2","pick":"River Plate","odds":1.48},
+    ]
+    random.shuffle(sample)
+    return sample
 
-# ---------------- Telegram ----------------
-bot = Bot(token=TELEGRAM_TOKEN)
+def build_acca(candidates: List[Dict], legs: int, target_return: float) -> List[Dict]:
+    """
+    Pick 'legs' selections aiming roughly at given returns for £1 stake.
+    This is a simple heuristic (choose mid odds to hit target ballpark).
+    """
+    # Try a few mixes and choose product closest to target_return
+    best, best_gap = None, 1e9
+    for _ in range(500):
+        picks = random.sample(candidates, k=min(legs, len(candidates)))
+        prod = 1.0
+        for p in picks:
+            prod *= p["odds"]
+        gap = abs(prod - target_return)
+        if gap < best_gap:
+            best, best_gap = picks, gap
+    return best or candidates[:legs]
 
-def send(chat_id, text):
-    return bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+def fmt_price(x: float) -> str:
+    return f"{x:.2f}"
 
-# ---------------- API-FOOTBALL ----------------
-BASE = "https://v3.football.api-sports.io"
-HEADERS = { "x-apisports-key": API_KEY }
+def render_acca_card(title: str, picks: List[Dict], stake: float) -> str:
+    product = 1.0
+    for p in picks:
+        product *= p["odds"]
+    est = stake * product
 
-def api_get(path, params=None):
-    r = requests.get(BASE + path, headers=HEADERS, params=params or {}, timeout=20)
-    r.raise_for_status()
-    return r.json().get("response", [])
-
-def acca_collect_fixtures():
-    today = datetime.now(timezone.utc).date().isoformat()
-    leagues = MAJOR if MAJOR else FALLBACK
-    fixtures = []
-    for lid in leagues:
-        try:
-            resp = api_get("/fixtures", {"league": lid, "season": SEASON, "date": today})
-            fixtures.extend(resp)
-        except Exception as e:
-            log.warning("fixtures fetch failed for league %s: %s", lid, e)
-    if len(fixtures) < 12:  # not enough? expand to fallback
-        for lid in FALLBACK:
-            try:
-                resp = api_get("/fixtures", {"league": lid, "season": SEASON, "date": today})
-                fixtures.extend(resp)
-            except Exception as e:
-                log.warning("fixtures fetch failed for fallback %s: %s", lid, e)
-    return fixtures
-
-def choose_leg(fixture):
-    home = fixture["teams"]["home"]["name"]
-    away = fixture["teams"]["away"]["name"]
-    match = f"{home} vs {away}"
-    fid = fixture["fixture"]["id"]
-
-    # fake market for demo (replace with real odds endpoint if needed)
-    odds = round(random.uniform(1.2, 2.0), 2)
-    market = random.choice(["Home Win","Away Win","Over 1.5","Over 2.5","BTTS: Yes","Double Chance 1X"])
-    kick = fixture["fixture"]["date"]
-    return {"match":match, "label":market, "odds":odds, "kick":kick, "fid":fid}
-
-def build_acca(legs, n, tgt_min, tgt_max):
-    for _ in range(1000):
-        picks = random.sample(legs, n)
-        prod = math.prod([p["odds"] for p in picks])
-        if tgt_min <= prod <= tgt_max:
-            return picks, prod
-    return picks, prod
-
-# ---------------- Formatting ----------------
-def format_acca_block(title, picks, prod, stake, bookmaker, style="D"):
-    est = stake * prod
-    if style == "D":
-        hdr = (f"{title}\nStake £{stake:.2f} | Odds {prod:.2f} | Return £{est:.2f} | {bookmaker}*")
-        sep = "──────────────────────────────"
-    else:
-        hdr = f"{title} — Stake £{stake:.2f} • Odds {prod:.2f} • Return £{est:.2f} • {bookmaker}"
-        sep = "-----------------------------"
-
-    lines = [hdr, sep]
-    for i,p in enumerate(picks,1):
-        when = datetime.fromisoformat(p["kick"].replace("Z","+00:00")).strftime("%a %H:%M")
-        lines.append(f"{i}. {p['match']} — <i>{p['label']}</i> (@{p['odds']:.2f}) • {when} UTC")
+    lines = []
+    lines.append("🏷️ *" + title + "*")
+    lines.append("────────────────────────")
+    for i, p in enumerate(picks, 1):
+        emoji = "⚽" if p["market"].lower() != "1x2" else "🏟️"
+        lines.append(f"{i}. {emoji} *{p['match']}*")
+        lines.append(f"   └ {p['league']} • {p['market']}: *{p['pick']}* • Odds: *{fmt_price(p['odds'])}*")
+    lines.append("────────────────────────")
+    lines.append(f"💷 Stake: *£{fmt_price(stake)}*")
+    lines.append(f"📈 Est. return: *£{fmt_price(est)}*  (Acca price {fmt_price(product)})")
+    lines.append("✅ Good luck! Bet responsibly.")
     return "\n".join(lines)
 
-def format_acca_message(a4,o4,a7,o7,a10,o10, style="D"):
-    top = "🎟 <b>JBOT • Daily ACCAs</b> (majors preferred, fallback if quiet)"
-    block4  = format_acca_block("🔵 4-Fold (safer)",    a4,o4, ACCA_STAKE, ACCA_BOOKMAKER, style)
-    block7  = format_acca_block("🟡 7-Fold (balanced)", a7,o7, ACCA_STAKE, ACCA_BOOKMAKER, style)
-    block10 = format_acca_block("🔴 10-Fold (longshot)",a10,o10, ACCA_STAKE, ACCA_BOOKMAKER, style)
-    return "\n\n".join([top, block4, "", block7, "", block10, "\n* Uses Bet365 when available; else best available bookmaker."])
-
-# ---------------- Core ----------------
-def generate_and_send_accas():
-    fixtures = acca_collect_fixtures()
-    legs = [choose_leg(f) for f in fixtures if f]
-    if len(legs) < 12:
-        return "⚠️ Not enough fixtures for ACCAs today."
-
-    a4,o4   = build_acca(legs,4,T4_MIN,T4_MAX)
-    a7,o7   = build_acca(legs,7,T7_MIN,T7_MAX)
-    a10,o10 = build_acca(legs,10,T10_MIN,T10_MAX)
-
-    msg = format_acca_message(a4,o4,a7,o7,a10,o10, style=ACCA_STYLE)
-    send(GROUP_CHAT_ID, msg)
-    if DM_CHAT_ID:
-        send(DM_CHAT_ID, msg)
-    return "✅ ACCAs sent."
-
-def daily_loop():
-    sent_today = False
-    while True:
-        try:
-            now = datetime.now(timezone.utc).strftime("%H:%M")
-            if now == ACCA_TIME and not sent_today:
-                generate_and_send_accas()
-                sent_today = True
-            if now != ACCA_TIME:
-                sent_today = False
-        except Exception as e:
-            log.exception("loop error: %s", e)
-        time.sleep(60)
-
-# ---------------- Command ----------------
-def acca_command(update, context):
+def send_accas_now():
     try:
-        res = generate_and_send_accas()
-        if res.startswith("⚠️"):
-            update.message.reply_text(res)
+        cands = fetch_candidates_for_today()
+        if len(cands) < 10:
+            log.warning("Only %d candidates available; slips may be repetitive.", len(cands))
+
+        acca4  = build_acca(cands, 4,  TARGET_RETURNS_4)
+        acca7  = build_acca(cands, 7,  TARGET_RETURNS_7)
+        acca10 = build_acca(cands, 10, TARGET_RETURNS_10)
+
+        header = "🎯 *JBOT Daily ACCAs*  \n" \
+                 f"🕙 {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC  \n" \
+                 "Mix of 1X2, BTTS & Overs from bigger leagues.\n"
+
+        bot.send_message(chat_id=CHAT_ID, text=header, parse_mode=ParseMode.MARKDOWN)
+
+        bot.send_message(chat_id=CHAT_ID,
+                         text=render_acca_card("4-Fold (≈£3 return)", acca4, STAKE_PER_ACCA),
+                         parse_mode=ParseMode.MARKDOWN)
+        bot.send_message(chat_id=CHAT_ID,
+                         text=render_acca_card("7-Fold (≈£5 return)", acca7, STAKE_PER_ACCA),
+                         parse_mode=ParseMode.MARKDOWN)
+        bot.send_message(chat_id=CHAT_ID,
+                         text=render_acca_card("10-Fold (≈£30 return)", acca10, STAKE_PER_ACCA),
+                         parse_mode=ParseMode.MARKDOWN)
+
+        log.info("ACCA messages sent.")
     except Exception as e:
-        update.message.reply_text(f"⚠️ ACCA command error:\n{e}")
+        log.exception("Failed to send ACCAs: %s", e)
 
-# ---------------- Runner ----------------
-def main():
-    # Start Telegram command listener
-    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("acca", acca_command))
-    updater.start_polling()
+def seconds_until_next_hhmm(hhmm: str) -> int:
+    """Return seconds until the next occurrence of HH:MM (24h) in server time."""
+    now = datetime.now()
+    hour, minute = map(int, hhmm.split(":"))
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return int((target - now).total_seconds())
 
-    # Run daily loop in main thread
-    daily_loop()
+def main_loop():
+    # Optional: fire once at start for quick check
+    if SEND_ON_START:
+        log.info("SEND_ON_START=true → sending ACCAs immediately.")
+        send_accas_now()
+
+    while True:
+        wait_s = seconds_until_next_hhmm(ACCA_TIME_HHMM)
+        log.info("Sleeping %s seconds until next ACCA slot (%s).", wait_s, ACCA_TIME_HHMM)
+        # Sleep in chunks so Render “free” plans don’t think we’ve died
+        slept = 0
+        chunk = 60
+        while slept < wait_s:
+            time.sleep(min(chunk, wait_s - slept))
+            slept += min(chunk, wait_s - slept)
+        send_accas_now()
+        # small gap to avoid double-send if server clock drifts
+        time.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    log.info("ACCA bot (no-polling) starting…")
+    main_loop()
