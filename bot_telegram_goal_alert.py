@@ -6,7 +6,7 @@ from datetime import datetime
 from random import choice
 
 from telegram import Bot, Update
-from telegram import ParseMode
+from telegram import ParseMode          # PTB v13.x style import
 from telegram.ext import Updater, CommandHandler, CallbackContext
 
 # ---------- Logging ----------
@@ -18,7 +18,7 @@ logger = logging.getLogger("goal-alert-bot")
 
 # ---------- Env ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID")  # e.g. -4861665044
+CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID")  # e.g. -1002957942850
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")  # reserved for your fetcher
 
 HEARTBEAT_ENABLED = os.getenv("HEARTBEAT_ENABLED", "1") == "1"
@@ -30,6 +30,7 @@ if not TELEGRAM_TOKEN or not CHAT_ID:
     )
 
 # ---------- Markdown V2 escaping ----------
+# Escape all characters that Telegram MarkdownV2 treats specially
 _MD2_PATTERN = re.compile(r'([_*\[\]()~`>#+\-=|{}.!])')
 
 def esc(s: str) -> str:
@@ -66,9 +67,9 @@ def build_option_d_alert(
     rline = esc(f"✅ Recommended Bet: {recommended}")
     status_line = esc(f"📌 Status: {status}")
 
-    # Bold with *...* in MarkdownV2 (keep only allowed chars unescaped there)
-    header = "*{}*".format(esc("JBOT GOAL ALERT").replace("\\ ", " "))  # keep bold text readable
-    # Use the emoji title (escaped) above the header to look nice in Telegram
+    # Bold header (keep visible words; we already escape risky chars)
+    header = "*{}*".format(esc("JBOT GOAL ALERT").replace("\\ ", " "))
+
     text = (
         f"{title}\n\n"
         f"{header}\n\n"
@@ -122,16 +123,19 @@ def cmd_testalert(update: Update, context: CallbackContext) -> None:
 
 # ---------- App lifecycle ----------
 def notify_start(bot: Bot) -> None:
+    """Send a startup message WITHOUT replying to anything (avoids BadRequest)."""
     try:
         bot.send_message(
             chat_id=CHAT_ID,
             text=esc("✅ Goal Alert Bot is live and monitoring matches!"),
             parse_mode=ParseMode.MARKDOWN_V2,
         )
+        logger.info("Startup notify sent.")
     except Exception as e:
         logger.error(f"Startup notify failed: {e}")
 
 def heartbeat_job(context: CallbackContext) -> None:
+    """Safe heartbeat that uses MarkdownV2-escaped text."""
     try:
         context.bot.send_message(
             chat_id=CHAT_ID,
@@ -141,7 +145,7 @@ def heartbeat_job(context: CallbackContext) -> None:
     except Exception as e:
         logger.warning(f"Heartbeat send failed: {e}")
 
-# ---------- Placeholder: where your real alert logic will call send_alert ----------
+# ---------- Alert sending API (called by your model/fetcher) ----------
 def send_alert(bot: Bot, **kwargs) -> None:
     """
     Call this from your polling / model logic when a match qualifies.
@@ -153,7 +157,7 @@ def send_alert(bot: Bot, **kwargs) -> None:
     except Exception as e:
         logger.error(f"Error sending alert: {e}")
 
-# Example of how you'd trigger (remove after wiring real logic):
+# Example one-off trigger (optional)
 def demo_trigger_once(bot: Bot):
     try:
         text = build_option_d_alert(
@@ -185,10 +189,10 @@ def main():
     # Start polling (no webhook conflicts)
     updater.start_polling()
 
-    # Announce we're live
+    # Announce we're live (no reply_to used)
     notify_start(updater.bot)
 
-    # Optional heartbeat
+    # Optional heartbeat (every HEARTBEAT_INTERVAL_MIN minutes)
     if HEARTBEAT_ENABLED and HEARTBEAT_INTERVAL_MIN > 0:
         updater.job_queue.run_repeating(
             heartbeat_job,
