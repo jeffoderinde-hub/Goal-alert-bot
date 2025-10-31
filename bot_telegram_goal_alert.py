@@ -2,36 +2,47 @@
 import os
 import re
 import logging
+import threading
 from datetime import datetime
 from random import choice
-from threading import Thread
 
+import requests
 from flask import Flask, jsonify
+
 from telegram import Bot, Update, ParseMode
 from telegram.ext import Updater, CommandHandler, CallbackContext
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# ---------- Logging ----------
+# -------------------- Logging & ENV --------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
 )
 logger = logging.getLogger("goal-alert-bot")
 
-# ---------- Env ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID")  # e.g. -4731356113
+CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID")  # e.g. "-1001234567890" or "-4731356113"
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
+
 HEARTBEAT_ENABLED = os.getenv("HEARTBEAT_ENABLED", "1") == "1"
 HEARTBEAT_INTERVAL_MIN = int(os.getenv("HEARTBEAT_INTERVAL_MIN", "180"))
 
-if not TELEGRAM_TOKEN or not CHAT_ID:
-    raise RuntimeError("Missing env vars: TELEGRAM_BOT_TOKEN and/or TELEGRAM_GROUP_CHAT_ID.")
+GOAL_ALERTS_ENABLED = os.getenv("GOAL_ALERTS_ENABLED", "1") == "1"
+POLL_SECS = int(os.getenv("POLL_SECS", "60"))
 
-# ---------- Markdown V2 escaping ----------
+if not TELEGRAM_TOKEN or not CHAT_ID:
+    raise RuntimeError(
+        "Missing env vars: TELEGRAM_BOT_TOKEN and/or TELEGRAM_GROUP_CHAT_ID."
+    )
+
+# -------------------- MarkdownV2 escaping --------------------
 _MD2_PATTERN = re.compile(r'([_*\[\]()~`>#+\-=|{}.!])')
+
 def esc(s: str) -> str:
     return _MD2_PATTERN.sub(r'\\\1', str(s))
 
-# ---------- Message builders ----------
+# -------------------- Message builders --------------------
 def build_option_d_alert(
     home: str,
     away: str,
@@ -43,7 +54,7 @@ def build_option_d_alert(
     last10_sot: int,
     last10_corners: int,
     recommended: str,
-    status: str = "Pending",
+    status: str = "Pending"
 ) -> str:
     title = esc("🧠 JBOT GOAL ALERT")
     mline = esc(f"Match: {home} vs {away}")
@@ -86,7 +97,7 @@ def build_heartbeat_message() -> str:
     now = esc(datetime.utcnow().strftime("%H:%M UTC"))
     return f"{choice(phrases)} \\| {now}"
 
-# ---------- Telegram handlers ----------
+# -------------------- Telegram commands --------------------
 def cmd_start(update: Update, context: CallbackContext) -> None:
     update.message.reply_text(
         esc("👋 Goal Alert Bot is ready to send updates!"),
@@ -109,7 +120,7 @@ def cmd_testalert(update: Update, context: CallbackContext) -> None:
     )
     update.message.reply_text(sample, parse_mode=ParseMode.MARKDOWN_V2)
 
-# ---------- Lifecycle helpers ----------
+# -------------------- Bot lifecycle helpers --------------------
 def notify_start(bot: Bot) -> None:
     try:
         bot.send_message(
@@ -130,54 +141,119 @@ def heartbeat_job(context: CallbackContext) -> None:
     except Exception as e:
         logger.warning(f"Heartbeat send failed: {e}")
 
-# ---------- Example alert trigger you can call from your logic ----------
-def send_alert(bot: Bot, **kwargs) -> None:
+# -------------------- Live fixtures polling --------------------
+def _fetch_live_fixtures():
+    """Call API-Football live fixtures and return list of fixture dicts."""
+    if not API_FOOTBALL_KEY:
+        logger.warning("No API_FOOTBALL_KEY set; skipping poll.")
+        return []
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    url = "https://v3.football.api-sports.io/fixtures?live=all"
     try:
-        text = build_option_d_alert(**kwargs)
-        bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.MARKDOWN_V2)
+        r = requests.get(url, headers=headers, timeout=12)
+        r.raise_for_status()
+        j = r.json()
+        resp = j.get("response", [])
+        return resp if isinstance(resp, list) else []
     except Exception as e:
-        logger.error(f"Error sending alert: {e}")
+        logger.error(f"Live fixtures fetch failed: {e}")
+        return []
 
-# ---------- Tiny Flask web server (keeps Render Web Service port open) ----------
-app = Flask(__name__)
+def goal_check_job(bot: Bot):
+    """Runs every POLL_SECS; simple demo trigger. Replace with your logic."""
+    if not GOAL_ALERTS_ENABLED:
+        logger.debug("Goal alerts disabled; skipping cycle.")
+        return
 
-@app.route("/")
+    fixtures = _fetch_live_fixtures()
+    logger.debug(f"Polled live fixtures: {len(fixtures)} found")
+
+    for fx in fixtures:
+        try:
+            minute = (fx["fixture"]["status"]["elapsed"] or 0) or 0
+            home = fx["teams"]["home"]["name"]
+            away = fx["teams"]["away"]["name"]
+            sh = fx["goals"]["home"] or 0
+            sa = fx["goals"]["away"] or 0
+
+            # --- Example trigger (late-goal chase). Tune as you like. ---
+            if 65 <= minute <= 80 and (sh + sa) <= 2:
+                logger.info(f"Trigger: {home} vs {away} @ {minute}’ {sh}-{sa}")
+                text = build_option_d_alert(
+                    home=home,
+                    away=away,
+                    minute=minute,
+                    score=f"{sh}-{sa}",
+                    prob_pct=70,
+                    pressure_index=9.5,
+                    last10_shots=5,
+                    last10_sot=3,
+                    last10_corners=2,
+                    recommended="Over 2.5 goals",
+                    status="Live ⚽",
+                )
+                bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN_V2
+                )
+        except Exception as e:
+            logger.warning(f"Fixture parse/alert failed: {e}")
+
+def start_goal_polling(bot: Bot):
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        goal_check_job,
+        "interval",
+        seconds=POLL_SECS,
+        args=[bot],
+        id="goal_check_job",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=15,
+    )
+    if HEARTBEAT_ENABLED and HEARTBEAT_INTERVAL_MIN > 0:
+        scheduler.add_job(
+            heartbeat_job,
+            "interval",
+            seconds=HEARTBEAT_INTERVAL_MIN * 60,
+            id="heartbeat_job",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=15,
+            kwargs={"context": CallbackContext(Bot(TELEGRAM_TOKEN))}
+        )
+    scheduler.start()
+    logger.info(f"Started goal polling every {POLL_SECS}s")
+
+# -------------------- Minimal Flask health server --------------------
+flask_app = Flask(__name__)
+
+@flask_app.route("/", methods=["GET"])
 def root():
-    return "OK", 200
+    return jsonify(ok=True, service="jbot")
 
-@app.route("/healthz")
-def health():
-    return jsonify(status="ok", time=datetime.utcnow().isoformat()), 200
-
-def run_web():
-    # Render injects PORT. Default to 10000 locally.
+def run_flask():
     port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    flask_app.run(host="0.0.0.0", port=port)
 
-# ---------- Main ----------
+# -------------------- Main --------------------
 def main():
-    # Start the tiny web server in the background so Render sees an open port
-    Thread(target=run_web, daemon=True).start()
+    # Start Flask in a side thread so Render Web Service binds a port
+    threading.Thread(target=run_flask, daemon=True).start()
 
-    # Telegram polling bot
     updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
     dp = updater.dispatcher
+
     dp.add_handler(CommandHandler("start", cmd_start))
     dp.add_handler(CommandHandler("testalert", cmd_testalert))
 
-    # IMPORTANT: drop any queued updates to prevent "terminated by other getUpdates request"
-    updater.start_polling(drop_pending_updates=True)
-
+    updater.start_polling()  # avoid clean=True to skip deprecation noise
     logger.info("Env OK. Starting bot...")
     notify_start(updater.bot)
 
-    if HEARTBEAT_ENABLED and HEARTBEAT_INTERVAL_MIN > 0:
-        updater.job_queue.run_repeating(
-            heartbeat_job,
-            interval=HEARTBEAT_INTERVAL_MIN * 60,
-            first=HEARTBEAT_INTERVAL_MIN * 60,
-            name="heartbeat_job",
-        )
+    # Start our polling/heartbeat jobs
+    start_goal_polling(updater.bot)
 
     updater.idle()
 
